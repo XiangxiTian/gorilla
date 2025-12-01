@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import numpy as np
 from bfcl_eval.model_handler.local_inference.llama import LlamaHandler
 from bfcl_eval.model_handler.utils import system_prompt_pre_processing_chat_model
 
@@ -49,6 +50,27 @@ class LlamaTopKHandler(LlamaHandler):
             **kwargs,
         )
         self.top_k = max(1, int(top_k))
+        self._embedder = self._maybe_init_embedder()
+
+    # ------------------------------------------------------------------
+    # Embedding model setup
+    # ------------------------------------------------------------------
+
+    def _maybe_init_embedder(self):
+        """
+        Lazily initialize an embedding model if the dependency is available.
+
+        We keep this optional so BFCL can still run even if sentence-transformers
+        is not installed; in that case we fall back to lexical retrieval.
+        """
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception:
+            # Soft failure: embeddings not available, will use lexical fallback.
+            return None
+
+        # Lightweight, widely-used general-purpose model
+        return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
     # ------------------------------------------------------------------
     # Prompting path override: restrict tools before building system prompt
@@ -124,6 +146,75 @@ class LlamaTopKHandler(LlamaHandler):
         functions: List[Dict], user_query: str, top_k: int
     ) -> List[Dict]:
         """
+        Dispatch to embedding-based retrieval if an embedder is present on
+        the handler instance; otherwise, this will be overridden at runtime
+        by the bound method in __getattribute__.
+        """
+        raise RuntimeError(
+            "This static stub should never be called directly; "
+            "the instance method implementation handles retrieval."
+        )
+
+    # NOTE: We define the real retrieval logic as an instance method so that it
+    # can access `self._embedder`. Python will bind this method on instances and
+    # ignore the static stub above.
+    def _retrieve_top_k_functions(  # type: ignore[override]
+        self, functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Prefer embedding-based retrieval when an embedder is available;
+        otherwise fall back to a simple lexical signal.
+        """
+        if len(functions) <= top_k:
+            return functions
+
+        if self._embedder is not None and user_query.strip():
+            return self._retrieve_with_embeddings(functions, user_query, top_k)
+
+        # Fallback: lexical overlap only
+        return self._retrieve_lexical(functions, user_query, top_k)
+
+    # ------------------------------------------------------------------
+    # Embedding-based retrieval
+    # ------------------------------------------------------------------
+
+    def _retrieve_with_embeddings(
+        self, functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Use cosine similarity between the query embedding and
+        (name + description) embedding of each tool.
+        """
+        # Build text for each tool
+        tool_texts: List[str] = []
+        for fn in functions:
+            name = str(fn.get("name", ""))
+            desc = str(fn.get("description", ""))
+            tool_texts.append(f"{name}. {desc}".strip())
+
+        # Encode; shape: (num_tools, dim) and (1, dim)
+        tool_embs = self._embedder.encode(tool_texts, convert_to_numpy=True)  # type: ignore[union-attr]
+        query_emb = self._embedder.encode([user_query], convert_to_numpy=True)[0]  # type: ignore[union-attr]
+
+        # Cosine similarity
+        # Add a small epsilon to avoid division by zero.
+        tool_norms = np.linalg.norm(tool_embs, axis=1) + 1e-8
+        query_norm = np.linalg.norm(query_emb) + 1e-8
+        sims = (tool_embs @ query_emb) / (tool_norms * query_norm)
+
+        # Highest similarity first
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+        return [functions[int(i)] for i in top_indices]
+
+    # ------------------------------------------------------------------
+    # Lexical fallback retrieval
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _retrieve_lexical(
+        functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
         Simple, dependency-free retrieval over tools/functions.
 
         Scoring heuristic:
@@ -133,9 +224,6 @@ class LlamaTopKHandler(LlamaHandler):
 
         Returns the top-k highest scoring tools (stable for ties via index).
         """
-        if len(functions) <= top_k:
-            return functions
-
         query_tokens = _tokenize(user_query)
         if not query_tokens:
             return functions[:top_k]
