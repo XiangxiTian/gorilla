@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+import numpy as np
+from bfcl_eval.model_handler.local_inference.llama import LlamaHandler
+from bfcl_eval.model_handler.utils import system_prompt_pre_processing_chat_model
+
+
+class LlamaTopKHandler(LlamaHandler):
+    """
+    Llama handler with a simple built-in top-k tool retrieval step.
+
+    This class is intended for finetuned Llama models that you want to evaluate
+    on BFCL while first restricting the available tools/functions to the
+    top-k most relevant ones for the current query.
+
+    Retrieval here is intentionally lightweight and self-contained (no extra
+    dependencies). It uses a simple keyword-overlap scoring between the
+    user query and each tool's name/description. You can customize or replace
+    `_retrieve_top_k_functions` with a more sophisticated retriever
+    (e.g., embeddings, BM25) if desired.
+    """
+
+    def __init__(
+        self,
+        model_name,
+        temperature,
+        registry_name,
+        is_fc_model,
+        dtype: str = "bfloat16",
+        top_k: int = 10,
+        **kwargs,
+    ) -> None:
+        """
+        Args:
+            model_name: HuggingFace model id for your finetuned Llama.
+            temperature: Sampling temperature.
+            registry_name: Internal BFCL registry name.
+            is_fc_model: Whether BFCL should treat this as FC mode.
+            dtype: Model dtype for vLLM/sglang backend.
+            top_k: Number of tools to keep after retrieval.
+        """
+        super().__init__(
+            model_name=model_name,
+            temperature=temperature,
+            registry_name=registry_name,
+            is_fc_model=is_fc_model,
+            dtype=dtype,
+            **kwargs,
+        )
+        self.top_k = max(1, int(top_k))
+        self._embedder = self._maybe_init_embedder()
+
+    # ------------------------------------------------------------------
+    # Embedding model setup
+    # ------------------------------------------------------------------
+
+    def _maybe_init_embedder(self):
+        """
+        Lazily initialize an embedding model if the dependency is available.
+
+        We keep this optional so BFCL can still run even if sentence-transformers
+        is not installed; in that case we fall back to lexical retrieval.
+        """
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception:
+            # Soft failure: embeddings not available, will use lexical fallback.
+            return None
+
+        # Lightweight, widely-used general-purpose model
+        return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    # ------------------------------------------------------------------
+    # Prompting path override: restrict tools before building system prompt
+    # ------------------------------------------------------------------
+
+    def _pre_query_processing_prompting(self, test_entry: dict) -> dict:
+        """
+        Override the OSSHandler implementation to:
+          1. Extract the user query from the test entry.
+          2. Run a simple retrieval over all available functions.
+          3. Keep only the top-k functions.
+          4. Build the system prompt using the reduced function set.
+        """
+        functions: List[Dict] = test_entry["function"]
+        test_entry_id: str = test_entry["id"]
+
+        user_query = self._extract_user_query(test_entry)
+        if user_query:
+            selected_functions = self._retrieve_top_k_functions(
+                functions, user_query, self.top_k
+            )
+        else:
+            # If we cannot reliably extract a query, fall back to truncation.
+            selected_functions = (
+                functions[: self.top_k] if len(functions) > self.top_k else functions
+            )
+
+        # Build the system prompt using only the selected functions.
+        test_entry["question"][0] = system_prompt_pre_processing_chat_model(
+            test_entry["question"][0],
+            selected_functions,
+            test_entry_id,
+        )
+
+        # Keep the (possibly reduced) function list in the inference data.
+        return {
+            "message": [],
+            "function": selected_functions,
+        }
+
+    # ------------------------------------------------------------------
+    # Retrieval helpers
+    # ------------------------------------------------------------------
+
+    def _extract_user_query(self, test_entry: dict) -> str:
+        """
+        Extract the user query text from the test entry.
+
+        We look at the first turn of `question` and return the first `user`
+        role content we find. This is sufficient for BFCL single-turn and
+        most multi-turn setups, and keeps the implementation minimal.
+        """
+        question = test_entry.get("question", [])
+        if not question:
+            return ""
+
+        first_turn = question[0]
+
+        # Multi-message turn: [ {role, content}, ... ]
+        if isinstance(first_turn, list):
+            for msg in first_turn:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    return str(msg.get("content", "")).strip()
+
+        # Single message turn: {role, content}
+        if isinstance(first_turn, dict) and first_turn.get("role") == "user":
+            return str(first_turn.get("content", "")).strip()
+
+        return ""
+
+    @staticmethod
+    def _retrieve_top_k_functions(
+        functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Dispatch to embedding-based retrieval if an embedder is present on
+        the handler instance; otherwise, this will be overridden at runtime
+        by the bound method in __getattribute__.
+        """
+        raise RuntimeError(
+            "This static stub should never be called directly; "
+            "the instance method implementation handles retrieval."
+        )
+
+    # NOTE: We define the real retrieval logic as an instance method so that it
+    # can access `self._embedder`. Python will bind this method on instances and
+    # ignore the static stub above.
+    def _retrieve_top_k_functions(  # type: ignore[override]
+        self, functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Prefer embedding-based retrieval when an embedder is available;
+        otherwise fall back to a simple lexical signal.
+        """
+        if len(functions) <= top_k:
+            return functions
+
+        if self._embedder is not None and user_query.strip():
+            return self._retrieve_with_embeddings(functions, user_query, top_k)
+
+        # Fallback: lexical overlap only
+        return self._retrieve_lexical(functions, user_query, top_k)
+
+    # ------------------------------------------------------------------
+    # Embedding-based retrieval
+    # ------------------------------------------------------------------
+
+    def _retrieve_with_embeddings(
+        self, functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Use cosine similarity between the real user query embedding and a
+        simulated query embedding generated for each tool.
+
+        For each tool we:
+          1. Ask the (finetuned) Llama model to write a short, natural-language
+             query that would be well-routed to that tool, *conditioning on the
+             current real user query as an example*.
+          2. Embed the simulated query with the sentence-transformer.
+          3. Rank tools by cosine similarity between simulated query and the
+             real user query embedding.
+        """
+        # 1) Ask the model to generate a simulated query per tool.
+        try:
+            simulated_queries = self._generate_simulated_queries(functions, user_query)
+        except Exception:
+            # If anything goes wrong, fall back to lexical retrieval.
+            return self._retrieve_lexical(functions, user_query, top_k)
+
+        # 2) Prepare texts to embed: use simulated query, falling back to name+desc.
+        tool_texts: List[str] = []
+        for fn, sim_q in zip(functions, simulated_queries):
+            if sim_q and sim_q.strip():
+                tool_texts.append(sim_q.strip())
+            else:
+                name = str(fn.get("name", ""))
+                desc = str(fn.get("description", ""))
+                tool_texts.append(f"{name}. {desc}".strip())
+
+        # Encode; shape: (num_tools, dim) and (1, dim)
+        tool_embs = self._embedder.encode(tool_texts, convert_to_numpy=True)  # type: ignore[union-attr]
+        query_emb = self._embedder.encode([user_query], convert_to_numpy=True)[0]  # type: ignore[union-attr]
+
+        # Cosine similarity
+        # Add a small epsilon to avoid division by zero.
+        tool_norms = np.linalg.norm(tool_embs, axis=1) + 1e-8
+        query_norm = np.linalg.norm(query_emb) + 1e-8
+        sims = (tool_embs @ query_emb) / (tool_norms * query_norm)
+
+        # Highest similarity first
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+        return [functions[int(i)] for i in top_indices]
+
+    # ------------------------------------------------------------------
+    # Simulated-query generation with the LLM itself
+    # ------------------------------------------------------------------
+
+    def _generate_simulated_queries(
+        self, functions: List[Dict], user_query: str
+    ) -> List[str]:
+        """
+        For each tool, ask the Llama model to write a short \"simulated\" user
+        query that would naturally require that tool, using the current real
+        user query as an in-context example.
+
+        This uses the same local OSS endpoint as normal inference, but with a
+        lightweight plain-text prompt (no BFCL system prompt wrapping).
+        """
+        simulated_queries: List[str] = []
+
+        # We reuse the same model+client that OSSHandler already manages.
+        model_id = getattr(self, "model_path_or_id", None) or self.model_name_huggingface
+
+        for fn in functions:
+            name = str(fn.get("name", ""))
+            desc = str(fn.get("description", ""))
+
+            prompt = (
+                "You are helping route user questions to tools.\n\n"
+                f"TOOL NAME: {name}\n"
+                f"TOOL DESCRIPTION: {desc}\n\n"
+                "CURRENT REAL USER QUERY (EXAMPLE):\n"
+                f"\"{user_query}\"\n\n"
+                "TASK:\n"
+                "Write ONE short, natural-language user query that would be a good "
+                "example of something that should use this tool. Do not mention the "
+                "tool name explicitly. Do not explain your reasoning. Only output the "
+                "query sentence itself.\n"
+            )
+
+            try:
+                # Use the same completions endpoint as OSSHandler._query_prompting.
+                resp = self.client.completions.create(  # type: ignore[attr-defined]
+                    model=model_id,
+                    prompt=prompt,
+                    max_tokens=64,
+                    temperature=0.5,
+                    timeout=120,
+                )
+                text = resp.choices[0].text.strip()
+            except Exception:
+                text = ""
+
+            simulated_queries.append(text)
+
+        return simulated_queries
+
+    # ------------------------------------------------------------------
+    # Lexical fallback retrieval
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _retrieve_lexical(
+        functions: List[Dict], user_query: str, top_k: int
+    ) -> List[Dict]:
+        """
+        Simple, dependency-free retrieval over tools/functions.
+
+        Scoring heuristic:
+            - Lowercase, whitespace-split tokenization.
+            - Score = number of shared tokens between query and
+              (tool name + description).
+
+        Returns the top-k highest scoring tools (stable for ties via index).
+        """
+        query_tokens = _tokenize(user_query)
+        if not query_tokens:
+            return functions[:top_k]
+
+        scored = []
+        for idx, fn in enumerate(functions):
+            name = str(fn.get("name", "")).lower()
+            desc = str(fn.get("description", "")).lower()
+            doc = f"{name} {desc}"
+            doc_tokens = _tokenize(doc)
+            score = len(query_tokens & doc_tokens)
+            scored.append((score, idx, fn))
+
+        # Sort by score descending, then by original index to keep determinism.
+        scored.sort(key=lambda x: (-x[0], x[1]))
+
+        # If all scores are zero (no lexical overlap), just fall back to first top_k.
+        if scored[0][0] == 0:
+            return functions[:top_k]
+
+        return [entry[2] for entry in scored[:top_k]]
+
+
+def _tokenize(text: str) -> set[str]:
+    """
+    Very simple tokenizer: lowercase + split on whitespace, strip punctuation.
+    """
+    import re
+
+    if not text:
+        return set()
+
+    # Replace non-alphanumeric characters with spaces, then split.
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return set(normalized.split())
+
