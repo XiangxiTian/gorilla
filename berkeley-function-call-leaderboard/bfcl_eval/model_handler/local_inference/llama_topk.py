@@ -182,15 +182,33 @@ class LlamaTopKHandler(LlamaHandler):
         self, functions: List[Dict], user_query: str, top_k: int
     ) -> List[Dict]:
         """
-        Use cosine similarity between the query embedding and
-        (name + description) embedding of each tool.
+        Use cosine similarity between the real user query embedding and a
+        simulated query embedding generated for each tool.
+
+        For each tool we:
+          1. Ask the (finetuned) Llama model to write a short, natural-language
+             query that would be well-routed to that tool, *conditioning on the
+             current real user query as an example*.
+          2. Embed the simulated query with the sentence-transformer.
+          3. Rank tools by cosine similarity between simulated query and the
+             real user query embedding.
         """
-        # Build text for each tool
+        # 1) Ask the model to generate a simulated query per tool.
+        try:
+            simulated_queries = self._generate_simulated_queries(functions, user_query)
+        except Exception:
+            # If anything goes wrong, fall back to lexical retrieval.
+            return self._retrieve_lexical(functions, user_query, top_k)
+
+        # 2) Prepare texts to embed: use simulated query, falling back to name+desc.
         tool_texts: List[str] = []
-        for fn in functions:
-            name = str(fn.get("name", ""))
-            desc = str(fn.get("description", ""))
-            tool_texts.append(f"{name}. {desc}".strip())
+        for fn, sim_q in zip(functions, simulated_queries):
+            if sim_q and sim_q.strip():
+                tool_texts.append(sim_q.strip())
+            else:
+                name = str(fn.get("name", ""))
+                desc = str(fn.get("description", ""))
+                tool_texts.append(f"{name}. {desc}".strip())
 
         # Encode; shape: (num_tools, dim) and (1, dim)
         tool_embs = self._embedder.encode(tool_texts, convert_to_numpy=True)  # type: ignore[union-attr]
@@ -205,6 +223,60 @@ class LlamaTopKHandler(LlamaHandler):
         # Highest similarity first
         top_indices = np.argsort(sims)[-top_k:][::-1]
         return [functions[int(i)] for i in top_indices]
+
+    # ------------------------------------------------------------------
+    # Simulated-query generation with the LLM itself
+    # ------------------------------------------------------------------
+
+    def _generate_simulated_queries(
+        self, functions: List[Dict], user_query: str
+    ) -> List[str]:
+        """
+        For each tool, ask the Llama model to write a short \"simulated\" user
+        query that would naturally require that tool, using the current real
+        user query as an in-context example.
+
+        This uses the same local OSS endpoint as normal inference, but with a
+        lightweight plain-text prompt (no BFCL system prompt wrapping).
+        """
+        simulated_queries: List[str] = []
+
+        # We reuse the same model+client that OSSHandler already manages.
+        model_id = getattr(self, "model_path_or_id", None) or self.model_name_huggingface
+
+        for fn in functions:
+            name = str(fn.get("name", ""))
+            desc = str(fn.get("description", ""))
+
+            prompt = (
+                "You are helping route user questions to tools.\n\n"
+                f"TOOL NAME: {name}\n"
+                f"TOOL DESCRIPTION: {desc}\n\n"
+                "CURRENT REAL USER QUERY (EXAMPLE):\n"
+                f"\"{user_query}\"\n\n"
+                "TASK:\n"
+                "Write ONE short, natural-language user query that would be a good "
+                "example of something that should use this tool. Do not mention the "
+                "tool name explicitly. Do not explain your reasoning. Only output the "
+                "query sentence itself.\n"
+            )
+
+            try:
+                # Use the same completions endpoint as OSSHandler._query_prompting.
+                resp = self.client.completions.create(  # type: ignore[attr-defined]
+                    model=model_id,
+                    prompt=prompt,
+                    max_tokens=64,
+                    temperature=0.5,
+                    timeout=120,
+                )
+                text = resp.choices[0].text.strip()
+            except Exception:
+                text = ""
+
+            simulated_queries.append(text)
+
+        return simulated_queries
 
     # ------------------------------------------------------------------
     # Lexical fallback retrieval
